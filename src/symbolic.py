@@ -41,23 +41,27 @@ def box(
     """
     if max_depth < 1:
         return z3.BoolVal(False) if depth_exceed_strict else z3.BoolVal(True)
-
     match alpha:
         case tn.Skip():
-            return z3.BoolVal(True)
+            return postcondition
         case tn.Asgn(name, e):
-            return z3.BoolVal(True)
+            return z3.substitute(postcondition, [(term_enc(tn.Var(name)), term_enc(e))])
         case tn.Seq(alpha_p, beta_p):
-            return z3.BoolVal(True)
+            return box(alpha_p, box(beta_p, postcondition, max_depth, depth_exceed_strict), max_depth, depth_exceed_strict)
         case tn.If(q, alpha_p, beta_p):
-            return z3.BoolVal(True)
+            #return simplify(z3.And(z3.Implies(fmla_enc(q), box(alpha_p, postcondition, max_depth, depth_exceed_strict))))
+            return z3.simplify(z3.And(z3.Implies(fmla_enc(q), box(alpha_p, postcondition, max_depth, depth_exceed_strict)), z3.Implies(z3.Not(fmla_enc(q)), box(beta_p, postcondition, max_depth, depth_exceed_strict))))
         case tn.While(q, alpha_p):
-            return z3.BoolVal(True)
+            #return simplify(box(z3.If(q, tn.Seq(alpha_p, alpha), tn.skip()), postcondition, max_depth - 1, depth_exceed_strict))
+            return box(tn.If(q, tn.Seq(alpha_p, tn.While(q, alpha_p)), tn.Skip()), postcondition, max_depth-1, depth_exceed_strict)
         case tn.Output(e):
-            return z3.BoolVal(True)
+            return postcondition
         case tn.Abort():
-            return z3.BoolVal(True)
+            return postcondition
+
         case _:
             raise TypeError(
                 f"box got {type(alpha)} ({alpha}), not Prog"
             )
+def test(a):
+    print(a)

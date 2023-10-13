@@ -11,9 +11,80 @@ from tinyscript_util import (
 	vars_term,
 )
 from functools import reduce
-import interpreter as interp
+from interpreter import exc
 import tinyscript as tn
 import z3
+
+INV_VAR = '#inv_true'
+
+def checktaint(term: tn.Term) -> tn.Formula:
+	"""
+	A helper function in the instrumentation of taint. This will help build the
+	conditional to check whether a term is tainted or not.
+
+	Args:
+		term(tn.Term): a tinyscript term to be inspected for whether it
+		contains tainted variables.
+
+	Returns:
+		tn.Formula: a tinyscript formula representing the idea: "At lease one of the
+		tinyscript variables in this term is tainted."
+	
+	"""
+	vars = vars_term(term)
+	form = tn.FalseC()
+	for var in vars:
+		name = var.name
+		form = tn.OrF(form, tn.EqF(tn.Var(name+'_taint'), tn.Const(1)))
+	return form
+
+def instrument_help(alpha: tn.Prog) -> tn.Prog:
+	"""
+	Recursive helper function for instrumentation; handles all of the main logic. 
+
+	Args:
+		alpha (tn.Prog): program subset to be instrumented.
+	
+	Returns:
+		tn.Prog: an instrumented version of alpha, to be returned and used in an outer
+		recursive call or by instrument.
+	
+	"""
+	match alpha:
+        # assignments can violate the invariant, so instrument them directly
+		case tn.Asgn(name, aexp):
+			tainted = checktaint(aexp)
+			marktainted = tn.If(tainted, tn.Asgn(name+'_taint', tn.Const(1)), tn.Asgn(name+'_taint', tn.Const(0)))
+
+			return tn.Seq(alpha, marktainted)
+        # composition cannot violate the invariant unless through either
+        # of its constituents, so recurse and do not add instrumentation directly
+		case tn.Seq(alpha_p, beta_p):
+			ins_alpha = instrument_help(alpha_p)
+			ins_beta = instrument_help(beta_p)
+			return tn.Seq(ins_alpha, ins_beta)
+        # same with conditionals
+		case tn.If(p, alpha_p, beta_p):
+			ins_alpha = instrument_help(alpha_p)
+			ins_beta = instrument_help(beta_p)
+
+			return tn.If(p, ins_alpha, ins_beta)
+        # same with while loops
+		case tn.While(q, alpha_p):
+			ins_alpha = instrument_help(alpha_p)
+			return tn.While(q, ins_alpha)
+		case tn.Skip():
+			return alpha
+		case tn.Output(a):
+			tainted = checktaint(a)
+			checktainted = tn.If(tainted, tn.Asgn(INV_VAR, tn.Const(0)), tn.Skip())
+			return tn.Seq(checktainted, alpha)
+		case tn.Abort():
+			return alpha
+		case _:
+			raise TypeError(
+                f"instrument got {type(alpha)} ({alpha}), not Prog"
+            )
 
 def instrument(alpha: tn.Prog, source_prefix: str='sec_') -> tn.Prog:
 	"""
@@ -33,7 +104,18 @@ def instrument(alpha: tn.Prog, source_prefix: str='sec_') -> tn.Prog:
 	    	to determine whether a trace in the original program
 	    	`alpha` exists that violates the taint policy.
 	"""
-	return alpha
+	vars = vars_prog(alpha)
+	init = tn.Asgn(INV_VAR, tn.Const(1))
+	for var in vars:
+		name = var.name
+		if(name.startswith(source_prefix)):
+			init = tn.Seq(init, tn.Asgn(name+'_taint', tn.Const(1)))
+		else:
+			init = tn.Seq(init, tn.Asgn(name+'_taint', tn.Const(0)))
+	instr = instrument_help(alpha)
+	#print(stringify(instr))
+	return tn.Seq(init, instr)
+
 
 def symbolic_check(
 	alpha: tn.Prog, 
@@ -66,7 +148,19 @@ def symbolic_check(
 	    	- Result.Unknown: The result is indeterminate (e.g. the
 	    	  solver timed out, returning z3.unknown).
 	"""
+	alpha_p = instrument(alpha, source_prefix)
+	post = tn.EqF(tn.Var(INV_VAR), tn.Const(1))
+	weakest_pre = box(alpha_p, fmla_enc(post), max_depth, False)
+	res, model = check_sat([z3.Not(weakest_pre)], timeout=timeout)
+	if res == z3.unsat:
+		return Result.Satisfies
+	elif res == z3.sat:
+		state = state_from_z3_model(alpha, model, complete=True)
+		final_state = exc(state, alpha_p, max_steps=1.e6, quiet=True)
+		if final_state[0].variables[INV_VAR] == 0:
+			return Result.Violates
 	return Result.Unknown
+
 
 if __name__ == "__main__":
 	from parser import parse, fmla_parse

@@ -3,9 +3,141 @@
 from symbolic import box, Result
 from tinyscript_util import (
 	check_sat,
-	stringify
+	stringify,
+	vars_prog,
+	vars_formula,
+	vars_term,
+	fmla_enc,
+	state_from_z3_model,
 )
 import tinyscript as tn
+import z3
+from interpreter import exc
+
+
+INV_VAR = '#inv_true'
+
+def instr_termcheck(terms: list[tn.Var]) -> tn.Prog:
+	"""
+	A helper function in the instrumentation of defuse. All it does is instrument
+	the tinyscript program alpha to become (for variable in alpha, if variable is not
+	defined yet, set the invariant flag to zero); alpha. Ensures that no variable is
+	accessed before use.
+
+	Args:
+		terms(list[tn.Var]): a list of tinyscript variables to be checked for whether
+		they have been defined yet.
+
+	Returns:
+		tn.Prog: a tinyscript program instrumented as described before, so that it
+		checks whether all of those tinyscript variables have been defined.	
+	
+	"""
+	base = tn.Skip()
+	for var in terms:
+		name = var.name
+		check = tn.If(tn.EqF(tn.Var(name+'_def'), tn.Const(0)), tn.Asgn(INV_VAR, tn.Const(0)), tn.Skip())
+		base = tn.Seq(base, check)
+	return base
+
+#def checkterm(term : tn.Term) -> list[tn.Var]: 
+	#return vars_term(term)
+	"""match term:
+		case tn.Const(a):
+			return []
+		case tn.Var(name):
+			return [name]
+		case tn.Difference(t1, t2):
+			return checkterm(t1) + checkterm(t2)
+		case tn.Sum(t1, t2):
+			return checkterm(t1) + checkterm(t2)
+		case tn.Product(t1, t2):
+			return checkterm(t1) + checkterm(t2)
+		case _:
+			raise TypeError(
+                f"checkterm got {type(term)} ({term}), not Term"
+            )
+	"""
+	#return: list of terms
+
+
+#def checkformula(form : tn.Formula) -> list[tn.Var]:
+	##return vars_formula(form)
+	"""match form:
+		case tn.FalseC():
+			return []
+		case tn.TrueC():
+			return []
+		case tn.NotF(f):
+			return checkformula(f)
+		case tn.AndF(f1, f2):
+			return checkformula(f1) + checkformula(f2)
+		case tn.OrF(f1, f2):
+			return checkformula(f1) + checkformula(f2)
+		case tn.ImpliesF(f1, f2):
+			return checkformula(f1) + checkformula(f2)
+		case tn.EqF(t1, t2):
+			return checkterm(t1) + checkterm(t2)
+		case tn.LtF(t1, t2):
+			return checkterm(t1) + checkterm(t2)
+		case _:
+			raise TypeError(
+                f"checkformula got {type(form)} ({form}), not Formula"
+            )	"""
+			
+	#return: list of terms
+
+def instrument_help(alpha: tn.Prog) -> tn.Prog:
+	"""
+	Recursive helper function for instrumentation; handles all of the main logic. 
+
+	Args:
+		alpha (tn.Prog): program subset to be instrumented.
+	
+	Returns:
+		tn.Prog: an instrumented version of alpha, to be returned and used in an outer
+		recursive call or by instrument.
+	
+	"""
+	match alpha:
+        # assignments can violate the invariant, so instrument them directly
+		case tn.Asgn(name, aexp):
+			used = vars_term(aexp)
+			checkused = instr_termcheck(used)
+			markdef = tn.Asgn(name+'_def', tn.Const(1))
+			return tn.Seq(tn.Seq(checkused, alpha), markdef)
+        # composition cannot violate the invariant unless through either
+        # of its constituents, so recurse and do not add instrumentation directly
+		case tn.Seq(alpha_p, beta_p):
+			ins_alpha = instrument_help(alpha_p)
+			ins_beta = instrument_help(beta_p)
+			return tn.Seq(ins_alpha, ins_beta)
+        # same with conditionals
+		case tn.If(p, alpha_p, beta_p):
+			ins_alpha = instrument_help(alpha_p)
+			ins_beta = instrument_help(beta_p)
+			used = vars_formula(p)
+			checkused = instr_termcheck(used)
+			return tn.Seq(checkused, tn.If(p, ins_alpha, ins_beta))
+        # same with while loops
+		case tn.While(q, alpha_p):
+			used = vars_formula(q)
+			checkused = instr_termcheck(used)
+			ins_alpha = instrument_help(alpha_p)
+			return tn.Seq(checkused, tn.While(q, ins_alpha))
+		case tn.Skip():
+			return alpha
+		case tn.Output(a):
+			used = vars_term(a)
+			checkused = instr_termcheck(used)
+			return tn.Seq(checkused, alpha)
+		case tn.Abort():
+			return alpha
+		case _:
+			raise TypeError(
+                f"instrument got {type(alpha)} ({alpha}), not Prog"
+            )
+	return
 
 def instrument(alpha: tn.Prog) -> tn.Prog:
 	"""
@@ -20,8 +152,18 @@ def instrument(alpha: tn.Prog) -> tn.Prog:
 	    	to use the box modality and a satisfiability solver
 	    	to determine whether a trace in the original program
 	    	`alpha` exists that uses an undefined variable.
-	"""
-	return alpha
+	""" 
+	vars = vars_prog(alpha)
+	init = tn.Asgn(INV_VAR, tn.Const(1))
+	for var in vars:
+		name = var.name
+		init = tn.Seq(init, tn.Asgn(name+'_def', tn.Const(0)))
+	#what uses variables?
+	#Output: a is a term
+	#Check ifs, 
+	instr = instrument_help(alpha)
+	#print(stringify(instr))
+	return tn.Seq(init, instr)
 
 def symbolic_check(
 	alpha: tn.Prog, 
@@ -53,6 +195,17 @@ def symbolic_check(
 	    	  solver timed out, returning z3.unknown).
 
 	"""
+	alpha_p = instrument(alpha)
+	post = tn.EqF(tn.Var(INV_VAR), tn.Const(1))
+	weakest_pre = box(alpha_p, fmla_enc(post), max_depth, False)
+	res, model = check_sat([z3.Not(weakest_pre)], timeout=timeout)
+	if res == z3.unsat:
+		return Result.Satisfies
+	elif res == z3.sat:
+		state = state_from_z3_model(alpha, model, complete=True)
+		final_state = exc(state, alpha_p, max_steps=1.e6, quiet=True)
+		if final_state[0].variables[INV_VAR] == 0:
+			return Result.Violates
 	return Result.Unknown
 
 if __name__ == "__main__":
